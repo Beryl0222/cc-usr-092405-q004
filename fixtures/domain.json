@@ -1,0 +1,94 @@
+{
+  "项目名称": "考古现场关系管理",
+  "参与角色": [
+    "现场领队",
+    "记录员",
+    "库管员",
+    "实验室人员",
+    "研究员",
+    "同行评议人"
+  ],
+  "参考状态": [
+    "勘探中",
+    "发掘中",
+    "待检测",
+    "研究中",
+    "已归档"
+  ],
+  "记录类型": [
+    "探方",
+    "地层",
+    "遗迹",
+    "墓葬",
+    "兆沟",
+    "祭祀坑",
+    "陪葬墓",
+    "器物",
+    "器物组合",
+    "铭文",
+    "测年样本",
+    "照片"
+  ],
+  "空间与层位关系": {
+    "contains": "包含（空间/单位从属）",
+    "above": "层位在上（较晚，叠压）",
+    "cuts": "打破",
+    "depicts": "拍摄/描绘（照片或铭文指向对象）",
+    "same_as": "同一对象"
+  },
+  "关系别名": {
+    "包含": "contains",
+    "叠压": "above",
+    "below": "above（摄入时交换端点归一化）",
+    "打破": "cuts",
+    "拍摄": "depicts",
+    "同一": "same_as"
+  },
+  "事件类型": [
+    "record.register",
+    "record.correct",
+    "number.resolve",
+    "spatial.relate",
+    "spatial.retract",
+    "dating.register",
+    "dating.withdraw",
+    "sample.consume",
+    "custody.checkout",
+    "custody.return",
+    "custody.transfer",
+    "claim.submit",
+    "claim.revise",
+    "claim.withdraw",
+    "peer.review",
+    "publication.release"
+  ],
+  "事件摄入状态": {
+    "applied": "通过全部校验并进入投影",
+    "duplicate": "event_id 与载荷均重复，幂等忽略",
+    "waiting": "设备哈希链缺环，等待祖先事件归队后自愈",
+    "quarantined": "语义不成立，隔离保留原值，不进入空间/样本/观点投影",
+    "rejected": "结构非法（字段缺失、类型错误、同 id 载荷冲突），不写入日志"
+  },
+  "保管链动作": {
+    "custody.checkout": "凭当前持有方 from_party 放行出库；在途不得重复出库",
+    "custody.return": "归还并登记现状，to_store 指定入库库房",
+    "custody.transfer": "跨库移交，from_party 必须等于当前持有方"
+  },
+  "观点置信带": {
+    "high": "[0.8, 1]，具备作为既定事实候选的置信度",
+    "medium": "[0.5, 0.8)，仅可作为假说发布",
+    "low": "[0, 0.5)，仅可作为假说发布"
+  },
+  "同行评议结论": ["support", "challenge", "neutral"],
+  "发布类别": {
+    "established": "既定事实：置信度≥0.8、发布日期前有独立 support 且无 challenge",
+    "hypothesis": "假说：竞争性、低置信或待核验观点必须以该类别发布"
+  },
+  "发布纪律": [
+    "观点必须引用至少一条可定位的当前证据",
+    "已撤回的测年不得作为观点证据，亦不得进入发布快照",
+    "发布是不可变事件，快照锚定发布日期当时的观点版本与评议",
+    "离线迟交的发布仍按其声明的发布日期锚定历史快照"
+  ],
+  "说明": "字段仅用于统一领域称谓与事件语义，业务记录应由 /events 接口产生。"
+}

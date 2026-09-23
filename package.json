@@ -1,0 +1,7 @@
+{
+  "name": "archaeology-fieldwork",
+  "private": true,
+  "scripts": {
+    "test": "node test_service.js"
+  }
+}
