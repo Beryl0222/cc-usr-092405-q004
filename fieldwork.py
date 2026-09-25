@@ -69,10 +69,26 @@ CONTENT_EVENTS = {
     "claim.withdraw",
     "peer.review",
     "publication.release",
+    "loan.apply",
+    "loan.approve",
+    "loan.decline",
+    "loan.pickup",
+    "loan.return",
+    "loan.consume",
+    "loan.recall",
 }
 
 REVIEW_VERDICTS = ("support", "challenge", "neutral")
 PUBLISH_AS = ("established", "hypothesis")
+
+# 借用申请生命周期（连续谱系）：
+# pending --approve--> approved --pickup--> on_loan
+#   pending/approved --decline--> declined（冻结件同样以 decline 终结）
+#   approved --pickup--> on_loan --return(部分)--> on_loan
+#   on_loan --全部归还--> returned --consume 确认 --> consumed
+#   on_loan 超过 due_at 未结清 --> overdue（查询时派生标记，非独立状态）
+#   消耗确认也可在 on_loan 上直接累计；returned_amount + consumed_amount
+#   + outstanding_amount 恒等于批准借用数量。
 
 ESTABLISHED_CONFIDENCE = 0.8
 DEFAULT_HOLDER = "主库房"
@@ -159,6 +175,8 @@ class Projection:
         self.claims = {}
         # release_id -> 发布快照
         self.releases = {}
+        # loan_id -> 借用申请聚合（含逐事件谱系 ledger）
+        self.loans = {}
 
     # -- 记录 ---------------------------------------------------------------
 
@@ -325,6 +343,8 @@ class Projection:
         dating["withdrawn_event_id"] = event["event_id"]
         dating["withdrawn_at"] = event["occurred_at"]
         self.datings_withdrawn[p["dating_id"]] = dating
+        # 撤回的年代判断冻结尚未交付（待审批/已批准未领用）的借用申请。
+        self.freeze_loans_for_dating_withdraw(p["dating_id"], event)
 
     # -- 样本消耗 -----------------------------------------------------------
 
@@ -336,14 +356,23 @@ class Projection:
             raise Quarantine(f"消耗事件指向不存在的样本: {p['sample_id']}")
         if p["amount"] <= 0:
             raise Quarantine("样本消耗量必须为正数")
-        consumed = sum(amount for _, amount in sample["consumed"])
+        consumed = sum(amount for _, amount, _ in sample["consumed"])
         if consumed + p["amount"] > sample["initial"] + 1e-9:
             raise Quarantine(
                 f"样本 {p['sample_id']} 余额不足: 现存 "
                 f"{sample['initial'] - consumed}{sample['unit']}, "
                 f"申请消耗 {p['amount']}{sample['unit']}"
             )
-        sample["consumed"].append((event["event_id"], p["amount"]))
+        # 已被借用申请锁定或已出库的余量不得被现场消耗侵占——账面余量必须与
+        # 保管链相互印证；canonical 顺序决定并发事件的胜负，负方隔离。
+        free = self._free_balance(p["sample_id"])
+        if p["amount"] > free + 1e-9:
+            raise Quarantine(
+                f"样本 {p['sample_id']} 可再分配余量不足: 未锁定在库 "
+                f"{round(free, 9)}{sample['unit']}, 申请消耗 "
+                f"{p['amount']}{sample['unit']}（其余在借/已锁定）"
+            )
+        sample["consumed"].append((event["event_id"], p["amount"], "direct"))
 
     # -- 保管链 -------------------------------------------------------------
 
@@ -430,6 +459,308 @@ class Projection:
         else:  # pragma: no cover - 分派表已约束
             raise FieldworkError(f"未知保管事件 {kind}")
         self.custody[item].append(entry)
+
+    # -- 样本借用 -----------------------------------------------------------
+
+    def _loan(self, loan_id, *, must_exist=True):
+        loan = self.loans.get(loan_id)
+        if loan is None and must_exist:
+            raise Quarantine(f"借用申请不存在: {loan_id}")
+        return loan
+
+    def _current_record_version(self, record_id):
+        record = self.records.get(record_id)
+        if record is None:
+            raise Quarantine(f"引用的记录不存在: {record_id}")
+        return record["versions"][-1]
+
+    def _sample_loan_totals(self, sample_id):
+        """返回该样本各借用当前占用量（按规范化重放后的当前状态）。
+
+        locked：已批准未领用；on_loan：在外未结清；returned：已回库但
+        申请尚未做消耗确认（可再分配）；consumed：经借用确认的消耗。
+        """
+        locked = on_loan = returned = consumed = 0.0
+        for loan in self.loans.values():
+            if loan["sample_id"] != sample_id:
+                continue
+            if loan["status"] in ("approved",):
+                locked += loan["amount"]
+            elif loan["status"] == "on_loan":
+                on_loan += loan["outstanding"]
+                returned += loan["returned_amount"]
+            elif loan["status"] == "returned":
+                returned += loan["returned_amount"]
+            elif loan["status"] == "consumed":
+                consumed += loan["consumed_amount"]
+                returned += loan["returned_amount"]
+        return locked, on_loan, returned, consumed
+
+    def _free_balance(self, sample_id):
+        """可再分配余量：初始量 − 直接消耗 − 在借 − 已锁定 − 已确认外借消耗。
+
+        已部分归还但未确认消耗的量已回到库房，可再次分配，故不计占用。
+        """
+        sample = self.samples.get(sample_id)
+        if sample is None:
+            return 0.0
+        direct_consumed = sum(a for _, a, kind in sample["consumed"]
+                              if kind == "direct")
+        locked, on_loan, _returned, loan_consumed = self._sample_loan_totals(sample_id)
+        reserved = locked + on_loan + loan_consumed
+        return sample["initial"] - direct_consumed - reserved
+
+    def apply_loan_apply(self, event):
+        p = event["payload"]
+        require(p, {
+            "loan_id": str,
+            "sample_id": str,
+            "lab_party": str,
+            "applicant": str,
+            "amount": (int, float),
+            "purpose": str,
+            "due_at": str,
+            "claim_id": str,
+            "storage_condition": str,
+        })
+        if p["loan_id"] in self.loans:
+            raise Quarantine(f"借用编号重复: {p['loan_id']}")
+        if p["amount"] <= 0:
+            raise Quarantine("借用数量必须为正数")
+        sample = self.samples.get(p["sample_id"])
+        if sample is None:
+            raise Quarantine(f"借用指向不存在的测年样本: {p['sample_id']}")
+        claim = self.claims.get(p["claim_id"])
+        if claim is None:
+            raise Quarantine(f"借用引用的研究主张不存在: {p['claim_id']}")
+        if claim["status"] != "active":
+            raise Quarantine(f"研究主张已 {claim['status']}，不能据此提出借用")
+        # 申请锚定的主张版本其证据必须仍为当前可用证据：撤回/隔离在先时，
+        # 新申请直接隔离；撤回在申请之后则由撤回事件冻结（见 dating/claim
+        # withdraw）。断链设备上的主张不在投影中，此处同样闭合不了。
+        claim_version = claim["versions"][-1]
+        for ref in claim_version["evidence"]:
+            if not self._evidence_current(ref):
+                raise Quarantine(f"研究主张的证据已撤回或不可用: {ref}")
+        due = parse_occurred_at(p["due_at"])
+        if due <= parse_occurred_at(event["occurred_at"]):
+            raise Quarantine("归还期限 due_at 必须晚于申请时间")
+        # 申请必须锚定当前样本版本与当前主张版本——离线重复请求携带的是同一
+        # 事件（event_id 相同），幂等返回 duplicate；若另立新申请则重新锚定。
+        sample_version = self._current_record_version(p["sample_id"])
+        claim_version = claim["versions"][-1]
+        loan = {
+            "loan_id": p["loan_id"],
+            "sample_id": p["sample_id"],
+            "lab_party": p["lab_party"],
+            "applicant": p["applicant"],
+            "amount": p["amount"],
+            "purpose": p["purpose"],
+            "storage_condition": p["storage_condition"],
+            "due_at": p["due_at"],
+            "claim_id": p["claim_id"],
+            "sample_version": sample_version["version"],
+            "sample_version_event": sample_version["event_id"],
+            "claim_version": claim_version["version"],
+            "claim_version_event": claim_version["event_id"],
+            "status": "pending",
+            "outstanding": 0.0,
+            "returned_amount": 0.0,
+            "consumed_amount": 0.0,
+            "approver": None,
+            "frozen": False,
+            "freeze_reasons": [],
+            "frozen_events": [],
+            "ledger": [],
+        }
+        loan["ledger"].append(self._ledger_entry(event, "apply", {
+            "amount": p["amount"], "due_at": p["due_at"],
+            "sample_version": sample_version["version"],
+            "claim_version": claim_version["version"],
+        }))
+        self.loans[p["loan_id"]] = loan
+
+    def apply_loan_approve(self, event):
+        p = event["payload"]
+        require(p, {"loan_id": str, "approver": str, "custodian_party": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] != "pending":
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 当前状态 {loan['status']}，不能审批")
+        if loan["frozen"]:
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 引用上下文已冻结: "
+                + "; ".join(loan["freeze_reasons"]))
+        # 无利益冲突：审批保管人不能是申请实验室成员，也不能是主张作者。
+        claim = self.claims[loan["claim_id"]]
+        if p["approver"] == loan["applicant"]:
+            raise Quarantine("审批保管人不能是申请人本人")
+        if p["approver"] == claim["author"]:
+            raise Quarantine("审批保管人不能是所引研究主张的作者（利益冲突）")
+        if p["custodian_party"] == loan["lab_party"]:
+            raise Quarantine("审批保管方不能是借入实验室本身（利益冲突）")
+        # 审批即锁定可用余量：并发申请按规范化顺序竞争，锁满即隔离。
+        free = self._free_balance(loan["sample_id"])
+        if loan["amount"] > free + 1e-9:
+            sample = self.samples[loan["sample_id"]]
+            raise Quarantine(
+                f"样本 {loan['sample_id']} 可再分配余量不足: "
+                f"{round(free, 9)}{sample['unit']}, "
+                f"申请借用 {loan['amount']}{sample['unit']}"
+            )
+        loan["status"] = "approved"
+        loan["approver"] = p["approver"]
+        loan["custodian_party"] = p["custodian_party"]
+        loan["approved_at"] = event["occurred_at"]
+        loan["ledger"].append(self._ledger_entry(event, "approve", {
+            "approver": p["approver"],
+            "custodian_party": p["custodian_party"],
+        }))
+
+    def apply_loan_decline(self, event):
+        p = event["payload"]
+        require(p, {"loan_id": str, "approver": str, "reason": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] not in ("pending", "approved"):
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 当前状态 {loan['status']}，不能驳回")
+        if loan["status"] == "approved" and p["approver"] != loan["approver"]:
+            raise Quarantine("只有原审批保管人可以驳回已批准申请")
+        loan["status"] = "declined"
+        loan["decline_reason"] = p["reason"]
+        loan["ledger"].append(self._ledger_entry(event, "decline", {
+            "approver": p["approver"], "reason": p["reason"]}))
+
+    def apply_loan_pickup(self, event):
+        p = event["payload"]
+        require(p, {"loan_id": str, "actor": str, "from_party": str,
+                    "condition": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] != "approved":
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 未经批准或已处理，不能领用")
+        if loan["frozen"]:
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 已冻结，尚未交付的申请停止放行: "
+                + "; ".join(loan["freeze_reasons"]))
+        if p["from_party"] != loan.get("custodian_party"):
+            raise Quarantine(
+                f"领用放行无效：审批保管方为 {loan.get('custodian_party')}，"
+                f"出库单声称 {p['from_party']}")
+        loan["status"] = "on_loan"
+        loan["outstanding"] = loan["amount"]
+        loan["picked_up_at"] = event["occurred_at"]
+        loan["ledger"].append(self._ledger_entry(event, "pickup", {
+            "actor": p["actor"], "from_party": p["from_party"],
+            "condition": p["condition"], "amount": loan["amount"]}))
+
+    def apply_loan_return(self, event):
+        p = event["payload"]
+        require(p, {"loan_id": str, "actor": str, "amount": (int, float),
+                    "condition": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] != "on_loan":
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 当前不在借，不能归还")
+        if p["amount"] <= 0:
+            raise Quarantine("归还数量必须为正数")
+        if p["amount"] > loan["outstanding"] + 1e-9:
+            raise Quarantine(
+                f"归还数量超过未结清量: 未结清 "
+                f"{loan['outstanding']}，归还 {p['amount']}")
+        loan["outstanding"] = round(loan["outstanding"] - p["amount"], 9)
+        loan["returned_amount"] = round(loan["returned_amount"] + p["amount"], 9)
+        if loan["outstanding"] <= 1e-9:
+            loan["status"] = "returned"
+        loan["ledger"].append(self._ledger_entry(event, "return", {
+            "actor": p["actor"], "amount": p["amount"],
+            "condition": p["condition"],
+            "to_store": p.get("to_store", DEFAULT_HOLDER),
+            "outstanding_after": loan["outstanding"]}))
+
+    def apply_loan_consume(self, event):
+        """实验室对借用样本的消耗确认；外借消耗与现场消耗同账扣减。"""
+        p = event["payload"]
+        require(p, {"loan_id": str, "actor": str, "amount": (int, float),
+                    "note": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] not in ("on_loan", "returned"):
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 当前状态 {loan['status']}，"
+                "须领用后才能确认消耗")
+        if p["amount"] <= 0:
+            raise Quarantine("消耗确认数量必须为正数")
+        if p["amount"] > loan["outstanding"] + 1e-9:
+            raise Quarantine(
+                f"消耗确认超过未结清量: 未结清 {loan['outstanding']}，"
+                f"确认 {p['amount']}（已归还部分不得再报消耗）")
+        loan["outstanding"] = round(loan["outstanding"] - p["amount"], 9)
+        loan["consumed_amount"] = round(loan["consumed_amount"] + p["amount"], 9)
+        sample = self.samples[loan["sample_id"]]
+        sample["consumed"].append((event["event_id"], p["amount"], "loan"))
+        if loan["outstanding"] <= 1e-9:
+            loan["status"] = "consumed"
+        loan["ledger"].append(self._ledger_entry(event, "consume", {
+            "actor": p["actor"], "amount": p["amount"], "note": p["note"],
+            "outstanding_after": loan["outstanding"]}))
+
+    def apply_loan_recall(self, event):
+        """逾期追索/主动召回：登记追索，不改变实物数量，只形成谱系节点。"""
+        p = event["payload"]
+        require(p, {"loan_id": str, "actor": str, "reason": str})
+        loan = self._loan(p["loan_id"])
+        if loan["status"] != "on_loan":
+            raise Quarantine(
+                f"借用 {loan['loan_id']} 当前状态 {loan['status']}，"
+                "仅在借申请可以追索")
+        loan.setdefault("recalls", []).append(self._ledger_entry(
+            event, "recall",
+            {"actor": p["actor"], "reason": p["reason"]}))
+        loan["ledger"].append(loan["recalls"][-1])
+
+    # -- 借用冻结：撤回的年代判断 / 被隔离的上下文 --------------------------
+
+    def _freeze_loan(self, loan, reason, event):
+        if not loan["frozen"]:
+            loan["frozen"] = True
+            loan["frozen_at"] = event["occurred_at"]
+            loan["freeze_reasons"] = []
+        if reason not in loan["freeze_reasons"]:
+            loan["freeze_reasons"].append(reason)
+        loan["frozen_events"].append(event["event_id"])
+        loan["ledger"].append(self._ledger_entry(event, "frozen", {"reason": reason}))
+
+    def freeze_loans_for_dating_withdraw(self, dating_id, event):
+        """测年撤回：冻结引用该测年（经主张证据链）的未交付申请。"""
+        loan_ids = self._loans_referencing_dating(dating_id)
+        for loan_id in loan_ids:
+            loan = self.loans[loan_id]
+            if loan["status"] in ("pending", "approved"):
+                self._freeze_loan(
+                    loan, f"所引主张依赖的测年 {dating_id} 已撤回", event)
+
+    def _loan_evidence(self, loan):
+        claim = self.claims.get(loan["claim_id"])
+        if claim is None:
+            return set()
+        version = next((v for v in claim["versions"]
+                        if v["version"] == loan["claim_version"]), None)
+        return set(version["evidence"]) if version else set()
+
+    def _loans_referencing_dating(self, dating_id):
+        return [loan_id for loan_id, loan in self.loans.items()
+                if dating_id in self._loan_evidence(loan)]
+
+    @staticmethod
+    def _ledger_entry(event, action, detail):
+        entry = {
+            "action": action,
+            "event_id": event["event_id"],
+            "device_id": event["device_id"],
+            "occurred_at": event["occurred_at"],
+        }
+        entry.update(detail)
+        return entry
 
     # -- 观点与评议 ---------------------------------------------------------
 
@@ -556,6 +887,12 @@ class Projection:
         claim["withdrawn_reason"] = p["reason"]
         claim["withdrawn_event_id"] = event["event_id"]
         claim["withdrawn_at"] = event["occurred_at"]
+        # 研究主张撤回后，引用它的未交付借用申请同样冻结。
+        for loan in self.loans.values():
+            if (loan["claim_id"] == p["claim_id"]
+                    and loan["status"] in ("pending", "approved")):
+                self._freeze_loan(
+                    loan, f"所引研究主张 {p['claim_id']} 已撤回", event)
 
     def apply_peer_review(self, event):
         p = event["payload"]
@@ -686,7 +1023,113 @@ APPLY = {
     "claim.withdraw": Projection.apply_claim_withdraw,
     "peer.review": Projection.apply_peer_review,
     "publication.release": Projection.apply_publication_release,
+    "loan.apply": Projection.apply_loan_apply,
+    "loan.approve": Projection.apply_loan_approve,
+    "loan.decline": Projection.apply_loan_decline,
+    "loan.pickup": Projection.apply_loan_pickup,
+    "loan.return": Projection.apply_loan_return,
+    "loan.consume": Projection.apply_loan_consume,
+    "loan.recall": Projection.apply_loan_recall,
 }
+
+
+# ---------------------------------------------------------------------------
+# 隔离上下文冻结扫描
+# ---------------------------------------------------------------------------
+
+def freeze_loans_from_quarantine(p: Projection, quarantine: dict) -> None:
+    """重放结束后，依据最终隔离清单冻结尚未交付的借用申请。
+
+    事件驱动的撤回（dating/claim withdraw）已在投影过程中即时冻结；本扫描
+    处理只能在完整重放后确定的"离线上下文冲突"：
+
+    * 同一编号的重复注册/提交（record.register / claim.submit /
+      dating.register）离线归队后被隔离——引用该编号的未交付申请冻结；
+    * 申请锚定的样本版本事件、主张版本事件或证据产生事件落入隔离清单。
+
+    冻结时间取冲突事件的 occurred_at（较早者），从而 /asof 能判定该时点
+    申请是否已冻结。扫描在重放末尾对最终状态执行，与事件喂入顺序无关。
+    """
+    # 编号 -> 被隔离的冲突事件（取最早 occurred_at）。
+    conflict_at: dict[tuple, datetime] = {}
+
+    def note(key, when):
+        old = conflict_at.get(key)
+        if old is None or when < old:
+            conflict_at[key] = when
+
+    for info in quarantine.values():
+        event = info["event"]
+        when = parse_occurred_at(event["occurred_at"])
+        payload = event["payload"]
+        etype = event["type"]
+        if etype == "record.register":
+            note(("sample", payload.get("record_id")), when)
+        elif etype == "claim.submit":
+            note(("claim", payload.get("claim_id")), when)
+        elif etype == "dating.register":
+            note(("dating", payload.get("dating_id")), when)
+        note(("event", event["event_id"]), when)
+
+    for loan_id in sorted(p.loans):
+        loan = p.loans[loan_id]
+        if loan["status"] not in ("pending", "approved") or loan["frozen"]:
+            continue
+        reasons_at: list[tuple[str, datetime]] = []
+        if ("sample", loan["sample_id"]) in conflict_at:
+            reasons_at.append((
+                f"样本 {loan['sample_id']} 存在离线重复注册，冲突上下文已被隔离",
+                conflict_at[("sample", loan["sample_id"])]))
+        if ("claim", loan["claim_id"]) in conflict_at:
+            reasons_at.append((
+                f"主张 {loan['claim_id']} 存在离线重复提交，冲突上下文已被隔离",
+                conflict_at[("claim", loan["claim_id"])]))
+        for eid in (loan["sample_version_event"], loan["claim_version_event"]):
+            if ("event", eid) in conflict_at:
+                reasons_at.append((f"锚定的版本事件 {eid} 已被隔离",
+                                   conflict_at[("event", eid)]))
+        for ref in sorted(_loan_evidence_refs(p, loan)):
+            for producer in _producing_event_ids(p, ref):
+                if ("event", producer) in conflict_at:
+                    reasons_at.append((f"证据 {ref} 的产生事件 {producer} 已被隔离",
+                                       conflict_at[("event", producer)]))
+            if ("dating", ref) in conflict_at:
+                reasons_at.append((f"测年 {ref} 存在离线重复登记，已隔离",
+                                   conflict_at[("dating", ref)]))
+        if not reasons_at:
+            continue
+        frozen_at = min(when for _, when in reasons_at)
+        loan["frozen"] = True
+        loan["frozen_at"] = frozen_at.isoformat()
+        loan["freeze_reasons"] = [reason for reason, _ in reasons_at]
+        loan["frozen_events"].append("quarantine-freeze")
+        synthetic = {
+            "event_id": "quarantine-freeze", "device_id": "system",
+            "occurred_at": frozen_at.isoformat(),
+        }
+        loan["ledger"].append(Projection._ledger_entry(
+            synthetic, "frozen",
+            {"reason": "; ".join(loan["freeze_reasons"])}))
+
+
+def _producing_event_ids(p: Projection, ref: str) -> set:
+    if ref in p.records:
+        record = p.records[ref]
+        return {record["versions"][0]["event_id"], record["registered_event"]}
+    if ref in p.datings:
+        return {p.datings[ref]["event_id"]}
+    if ref in p.datings_withdrawn:
+        return {p.datings_withdrawn[ref]["event_id"]}
+    return set()
+
+
+def _loan_evidence_refs(p: Projection, loan: dict) -> set:
+    claim = p.claims.get(loan["claim_id"])
+    if claim is None:
+        return set()
+    version = next((v for v in claim["versions"]
+                    if v["version"] == loan["claim_version"]), None)
+    return set(version["evidence"]) if version else set()
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +1229,8 @@ def replay(log, check_chains: bool) -> tuple[dict, dict, Projection, set, set]:
                            "reasons": ["重放结束时引用仍无法闭合"]}
             quarantine.setdefault(eid, {"event": event,
                                         "reasons": ["引用无法闭合（可能指向缺失事件）"]})
+    # 隔离清单（含断链后继）最终确定后，冻结引用被隔离上下文的未交付申请。
+    freeze_loans_from_quarantine(projection, quarantine)
     return status, quarantine, projection, waiting, broken
 
 
@@ -946,7 +1391,7 @@ def _current(claim_or_record):
     return claim_or_record["versions"][-1]
 
 
-def build_views(store: FieldworkStore) -> dict:
+def build_views(store: FieldworkStore, as_of: datetime | None = None) -> dict:
     p = store.projection
     conflicts = _collect_conflicts(p, store)
 
@@ -973,15 +1418,38 @@ def build_views(store: FieldworkStore) -> dict:
     samples = []
     for sid in sorted(p.samples):
         sample = p.samples[sid]
-        consumed = sum(amount for _, amount in sample["consumed"])
+        direct_consumed = sum(amount for _, amount, kind in sample["consumed"]
+                              if kind == "direct")
+        loan_consumed = sum(amount for _, amount, kind in sample["consumed"]
+                            if kind == "loan")
+        locked, on_loan, returned, loans_consumed_total = p._sample_loan_totals(sid)
+        overdue = None
+        if as_of is not None:
+            overdue = sum(
+                loan["outstanding"] for loan in p.loans.values()
+                if loan["sample_id"] == sid and loan["status"] == "on_loan"
+                and parse_occurred_at(loan["due_at"]) < as_of
+            )
+        # 可再分配 = 初始 − 现场消耗 − 在借未结 − 待交付锁定 − 外借已消耗；
+        # 已部分归还待确认的部分已回到库房，计入可再分配。
+        available = (sample["initial"] - direct_consumed - on_loan
+                     - locked - loans_consumed_total)
         samples.append({
             "sample_id": sid,
             "initial_amount": sample["initial"],
-            "consumed_amount": round(consumed, 9),
-            "balance": round(sample["initial"] - consumed, 9),
+            "consumed_amount": round(direct_consumed + loan_consumed, 9),
+            "direct_consumed_amount": round(direct_consumed, 9),
+            "loan_consumed_amount": round(loan_consumed, 9),
+            "balance": round(sample["initial"] - direct_consumed - loan_consumed, 9),
+            "locked_amount": round(locked, 9),
+            "on_loan_amount": round(on_loan, 9),
+            "overdue_amount": round(overdue, 9) if overdue is not None else None,
+            "returned_pending_amount": round(returned, 9),
+            "available_amount": round(available, 9),
             "unit": sample["unit"],
-            "consume_events": [eid for eid, _ in sorted(sample["consumed"])],
+            "consume_events": [eid for eid, _, _ in sorted(sample["consumed"])],
             "holder": p.holders.get(sid, DEFAULT_HOLDER),
+            "as_of": as_of.isoformat() if as_of is not None else None,
         })
 
     custody = {
@@ -1009,6 +1477,8 @@ def build_views(store: FieldworkStore) -> dict:
 
     releases = [p.releases[rid] for rid in sorted(p.releases)]
 
+    loans = [_loan_view(p.loans[lid], as_of) for lid in sorted(p.loans)]
+
     datings = [p.datings[did] for did in sorted(p.datings)]
     withdrawn = [p.datings_withdrawn[did] for did in sorted(p.datings_withdrawn)]
 
@@ -1019,9 +1489,60 @@ def build_views(store: FieldworkStore) -> dict:
         "custody": custody,
         "claims": claims,
         "releases": releases,
+        "loans": loans,
         "datings": datings,
         "datings_withdrawn": withdrawn,
         "conflicts": conflicts,
+    }
+
+
+def _loan_view(loan: dict, as_of: datetime | None) -> dict:
+    """渲染单个借用申请：固定谱系 + 按时点派生的逾期节点。"""
+    overdue = (
+        as_of is not None
+        and loan["status"] == "on_loan"
+        and parse_occurred_at(loan["due_at"]) < as_of
+    )
+    timeline = list(loan["ledger"])
+    if overdue:
+        # 逾期不是业务事件，但在观察时点上构成谱系的当前节点。
+        timeline.append({
+            "action": "overdue",
+            "occurred_at": loan["due_at"],
+            "outstanding_after": loan["outstanding"],
+        })
+    recalls = [
+        {k: v for k, v in entry.items() if k != "action"}
+        for entry in loan.get("recalls", [])
+    ]
+    return {
+        "loan_id": loan["loan_id"],
+        "sample_id": loan["sample_id"],
+        "lab_party": loan["lab_party"],
+        "applicant": loan["applicant"],
+        "status": loan["status"],
+        "amount": loan["amount"],
+        "outstanding_amount": loan["outstanding"],
+        "returned_amount": loan["returned_amount"],
+        "consumed_amount": loan["consumed_amount"],
+        "purpose": loan["purpose"],
+        "storage_condition": loan["storage_condition"],
+        "due_at": loan["due_at"],
+        "claim_id": loan["claim_id"],
+        "sample_version": loan["sample_version"],
+        "sample_version_event": loan["sample_version_event"],
+        "claim_version": loan["claim_version"],
+        "claim_version_event": loan["claim_version_event"],
+        "approver": loan["approver"],
+        "frozen": loan["frozen"],
+        "frozen_at": loan.get("frozen_at"),
+        "freeze_reasons": list(loan["freeze_reasons"]),
+        "overdue": overdue,
+        "overdue_since": loan["due_at"] if overdue else None,
+        "recalls": recalls,
+        "ledger": list(loan["ledger"]),
+        "timeline": timeline,
+        "as_of": as_of.isoformat() if as_of is not None else None,
     }
 
 
@@ -1172,6 +1693,6 @@ def state_as_of(store: FieldworkStore, cutoff: datetime) -> dict:
         else:
             sub._status[eid] = {"status": "applied", "reasons": []}
 
-    views = build_views(sub)
+    views = build_views(sub, as_of=cutoff)
     views["cutoff"] = cutoff.isoformat()
     return views

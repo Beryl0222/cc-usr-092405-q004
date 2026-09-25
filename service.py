@@ -68,7 +68,9 @@ class Handler(BaseHTTPRequestHandler):
                     "labeled": fw.build_views(STORE)["relations"],
                 })
             elif route == "/samples":
-                self._send(200, {"samples": fw.build_views(STORE)["samples"]})
+                self._send(200, {"samples": _samples_view(query)})
+            elif route == "/loans":
+                self._send(200, _loans_view(query))
             elif route == "/custody":
                 self._send(200, {"items": fw.build_views(STORE)["custody"]})
             elif route == "/datings":
@@ -125,6 +127,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         return
+
+
+def _observe_at(query):
+    """从查询参数取观察时点；缺省以当前时刻派生逾期标记。"""
+    raw = query.get("as_of", [None])[0]
+    if raw:
+        return fw.parse_occurred_at(raw)
+    return datetime.now()
+
+
+def _samples_view(query):
+    return fw.build_views(STORE, as_of=_observe_at(query))["samples"]
+
+
+def _loans_view(query):
+    """借用谱系视图；支持 sample_id/status 过滤与 as_of 指定观察日期。"""
+    cutoff = _observe_at(query)
+    views = fw.build_views(STORE, as_of=cutoff)
+    loans = views["loans"]
+    sample_id = query.get("sample_id", [None])[0]
+    if sample_id:
+        loans = [loan for loan in loans if loan["sample_id"] == sample_id]
+    status_filter = query.get("status", [None])[0]
+    if status_filter:
+        loans = [loan for loan in loans if loan["status"] == status_filter]
+    return {
+        "loans": loans,
+        "count": len(loans),
+        "samples": {s["sample_id"]: s for s in views["samples"]},
+    }
 
 
 def _record_history(record_id):

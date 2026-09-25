@@ -60,7 +60,14 @@
     "claim.revise",
     "claim.withdraw",
     "peer.review",
-    "publication.release"
+    "publication.release",
+    "loan.apply",
+    "loan.approve",
+    "loan.decline",
+    "loan.pickup",
+    "loan.return",
+    "loan.consume",
+    "loan.recall"
   ],
   "事件摄入状态": {
     "applied": "通过全部校验并进入投影",
@@ -74,6 +81,30 @@
     "custody.return": "归还并登记现状，to_store 指定入库库房",
     "custody.transfer": "跨库移交，from_party 必须等于当前持有方"
   },
+  "样本借用状态": {
+    "pending": "已申请待审批，不锁定余量",
+    "approved": "无利益冲突保管人已批准，可用余量被锁定，尚未领用",
+    "on_loan": "已领用在外，未结清；超过 due_at 派生 overdue 标记",
+    "returned": "已全部归还库房，待消耗确认（归还部分即恢复可再分配）",
+    "consumed": "归还与消耗确认合计结清，申请终结",
+    "declined": "待审批或已批准申请被保管人驳回（含冻结件的终结），不占用余量"
+  },
+  "样本借用动作": {
+    "loan.apply": "提出借用：锚定当前样本版本（sample_version_event）与当前主张版本（claim_version_event），载明数量、保管条件、研究目的、归还期限与借入实验室",
+    "loan.approve": "无利益冲突保管人审批：审批人不得是申请人或主张作者、保管方不得是借入实验室；审批即按规范化顺序锁定可用余量",
+    "loan.decline": "驳回待审批/已批准申请，原审批人方可驳回已批准件，锁定余量立即释放",
+    "loan.pickup": "领用出库，from_party 须等于审批保管方；冻结申请不得交付",
+    "loan.return": "部分或全部归还，登记现状与入库库房，归还量恢复可再分配",
+    "loan.consume": "实验室确认在外消耗，计入样本总账，不得超过未结清量",
+    "loan.recall": "逾期/主动追索登记，形成连续谱系节点，不改变实物数量"
+  },
+  "借用冻结规则": [
+    "撤回的测年（dating.withdraw）经主张证据链冻结引用它的待审批/已批准申请",
+    "撤回的研究主张（claim.withdraw）冻结引用它的未交付申请",
+    "离线重复注册/登记（record.register、claim.submit、dating.register）被隔离时，引用该编号的未交付申请冻结",
+    "锚定的样本版本事件、主张版本事件或证据产生事件落入隔离清单时冻结",
+    "已领用（on_loan 及之后）的申请不受冻结影响，按逾期与追索流程处理"
+  ],
   "观点置信带": {
     "high": "[0.8, 1]，具备作为既定事实候选的置信度",
     "medium": "[0.5, 0.8)，仅可作为假说发布",
