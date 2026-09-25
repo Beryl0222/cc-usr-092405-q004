@@ -69,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             elif route == "/samples":
                 self._send(200, {"samples": fw.build_views(STORE)["samples"]})
+            elif route == "/loans":
+                self._send(200, _loans_view(query))
             elif route == "/custody":
                 self._send(200, {"items": fw.build_views(STORE)["custody"]})
             elif route == "/datings":
@@ -150,6 +152,40 @@ def _as_of(query):
         raise fw.FieldworkError("需要 date 查询参数（ISO8601）")
     cutoff = fw.parse_occurred_at(raw)
     return fw.state_as_of(STORE, cutoff)
+
+
+def _loans_view(query):
+    """借用谱系与按样本汇总；支持 ?date= 做历史时点查询。"""
+    raw = query.get("date", [None])[0]
+    if raw:
+        views = fw.state_as_of(STORE, fw.parse_occurred_at(raw))
+    else:
+        views = fw.build_views(STORE)
+    sample_summary = [
+        {
+            "sample_id": s["sample_id"],
+            "out_on_loan": s["out_on_loan"],
+            "overdue_amount": s["overdue_amount"],
+            "reserved_amount": s["reserved_amount"],
+            "frozen_amount": s["frozen_amount"],
+            "reclaim_amount": s["reclaim_amount"],
+            "redistributable": s["redistributable"],
+            "reconciled": s["reconciled"],
+            "unit": s["unit"],
+        }
+        for s in views["samples"]
+    ]
+    sample_id = query.get("sample_id", [None])[0]
+    loans = views["loans"]
+    if sample_id:
+        loans = [loan for loan in loans if loan["sample_id"] == sample_id]
+        sample_summary = [s for s in sample_summary if s["sample_id"] == sample_id]
+    return {
+        "as_of": views.get("cutoff") or views["loan_totals"]["as_of"],
+        "totals": views["loan_totals"],
+        "loans": loans,
+        "samples": sample_summary,
+    }
 
 
 def main():

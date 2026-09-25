@@ -60,7 +60,13 @@
     "claim.revise",
     "claim.withdraw",
     "peer.review",
-    "publication.release"
+    "publication.release",
+    "loan.apply",
+    "loan.approve",
+    "loan.pickup",
+    "loan.return",
+    "loan.consume",
+    "loan.recall"
   ],
   "事件摄入状态": {
     "applied": "通过全部校验并进入投影",
@@ -73,6 +79,22 @@
     "custody.checkout": "凭当前持有方 from_party 放行出库；在途不得重复出库",
     "custody.return": "归还并登记现状，to_store 指定入库库房",
     "custody.transfer": "跨库移交，from_party 必须等于当前持有方"
+  },
+  "样本借用动作": {
+    "loan.apply": "申请引用当前样本版本与研究主张版本，载明实验室、保管条件、消耗量与到期日",
+    "loan.approve": "无利益冲突的保管人审批；审批即锁定可再分配余量，引用失效则隔离",
+    "loan.pickup": "领用出库，可分批；未交付部分在上下文失效后冻结",
+    "loan.return": "部分归还，登记现状；归还量不得超过在外量",
+    "loan.consume": "在外消耗确认，逐笔入账并与归还共同结案",
+    "loan.recall": "召回：未交付预留立即释放，已交付部分转入追索"
+  },
+  "借用单状态": {
+    "requested": "已申请未审批，不锁定余量",
+    "reserved": "已审批锁定，尚未领用（占用可再分配余量）",
+    "active": "已有领用在外（未交付余量仍预锁）",
+    "frozen": "派生状态：引用的主张撤回或年代证据失效，未交付部分冻结、不得出库",
+    "recalled": "已召回，在外部分追索中，未交付预留已释放",
+    "completed": "归还+消耗与批准量对齐，承诺了结"
   },
   "观点置信带": {
     "high": "[0.8, 1]，具备作为既定事实候选的置信度",

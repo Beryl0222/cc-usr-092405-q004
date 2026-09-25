@@ -684,5 +684,605 @@ class HttpApiTest(unittest.TestCase):
         error.exception.close()
 
 
+class LoanTestBase(unittest.TestCase):
+    """借用测试公共夹具：S1 初始 10g、已直接消耗 3g（余 7g），证据 D1/G1 有效。"""
+
+    def setUp(self):
+        self.a, self.b = build_expedition()
+        self.store = FieldworkStore()
+        self.store.ingest_batch(self.a.events)
+        self.store.ingest(self.a.emit("claim.submit", {
+            "claim_id": "C-loan", "subject": "M1年代",
+            "proposition": "主墓下葬于战国晚期", "confidence": 0.9,
+            "evidence": ["D1", "G1"], "author": "研究员甲"},
+            "2026-05-10T08:00"))
+
+    def loan_apply(self, loan_id="L1", *, amount=4.0, lab="北大实验室",
+                   applicant="研究员甲", due="2026-08-01T00:00",
+                   at="2026-05-15T08:00", device=None, claim="C-loan"):
+        dev = device or self.a
+        return dev.emit("loan.apply", {
+            "loan_id": loan_id, "sample_id": "S1", "claim_id": claim,
+            "applicant": applicant, "lab": lab,
+            "purpose": "残留物分析", "storage_condition": "4℃避光",
+            "requested_amount": amount, "due_date": due}, at)
+
+    def approve(self, loan_id="L1", approver="库管主任丙",
+                at="2026-05-16T09:00", device=None):
+        dev = device or self.a
+        return dev.emit("loan.approve",
+                        {"loan_id": loan_id, "approver": approver}, at)
+
+    def sample_s1(self):
+        return next(s for s in fw.build_views(self.store)["samples"]
+                    if s["sample_id"] == "S1")
+
+    def loan(self, loan_id="L1"):
+        return next(l for l in fw.build_views(self.store)["loans"]
+                    if l["loan_id"] == loan_id)
+
+
+class LoanLifecycleTest(LoanTestBase):
+    def test_apply_anchors_current_sample_and_claim_versions(self):
+        self.assertEqual(self.store.ingest(self.loan_apply())["status"], "applied")
+        loan = self.loan()
+        # S1 注册后无校正，锚定样本 v1；主张亦为 v1。
+        self.assertEqual(loan["sample_version"], 1)
+        self.assertEqual(loan["claim_version"], 1)
+        self.assertTrue(loan["sample_version_current"])
+        self.assertTrue(loan["claim_version_current"])
+        # 未审批不占用余量。
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 7.0)
+
+    def test_anchored_version_survives_later_revision(self):
+        self.store.ingest(self.loan_apply())
+        self.store.ingest(self.approve())
+        # 主张之后出新版：借单仍锚定 v1，不被视为失效，仍可领用。
+        self.store.ingest(self.a.emit("claim.revise", {
+            "claim_id": "C-loan", "proposition": "战国晚期偏晚",
+            "confidence": 0.85, "evidence": ["D1", "G1"]}, "2026-05-17T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["claim_version"], 1)
+        self.assertFalse(loan["claim_version_current"])
+        ev = self.a.emit("loan.pickup", {"loan_id": "L1", "amount": 1.0,
+                                        "actor": "丁", "condition": "完好"},
+                         "2026-05-18T08:00")
+        self.assertEqual(self.store.ingest(ev)["status"], "applied")
+
+    def test_conflicted_approvers_rejected(self):
+        self.store.ingest(self.loan_apply())
+        for bad in ("研究员甲", "北大实验室"):
+            ev = self.approve(approver=bad, at=f"2026-05-16T{bad and '09'}:"
+                                                f"00")
+            result = self.store.ingest(ev)
+            self.assertEqual(result["status"], "quarantined",
+                             f"{bad} 存在利益冲突却审批成功")
+        # 主张作者同样冲突。
+        ev = self.a.emit("loan.approve", {"loan_id": "L1",
+                                          "approver": "研究员甲"},
+                         "2026-05-16T10:00")
+        self.assertEqual(self.store.ingest(ev)["status"], "quarantined")
+        # 无冲突保管人通过并锁定。
+        self.assertEqual(self.store.ingest(self.approve())["status"], "applied")
+        self.assertEqual(self.loan()["status"], "reserved")
+        self.assertEqual(self.sample_s1()["reserved_amount"], 4.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 3.0)
+
+    def test_partial_pickup_return_consume_form_lineage_and_settle(self):
+        self.store.ingest(self.loan_apply(amount=4.0))
+        self.store.ingest(self.approve())
+        self.store.ingest(self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": 3.0, "actor": "丁",
+            "condition": "封口完好"}, "2026-05-20T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["status"], "active")
+        self.assertEqual(loan["out_amount"], 3.0)
+        # 尚有 1g 已批未领，继续预锁。
+        self.assertEqual(self.sample_s1()["reserved_amount"], 1.0)
+        self.assertEqual(self.sample_s1()["out_on_loan"], 3.0)
+
+        # 超额领用被拒。
+        over = self.a.emit("loan.pickup", {"loan_id": "L1", "amount": 2.0,
+                                           "actor": "丁", "condition": "完好"},
+                           "2026-05-21T08:00")
+        self.assertEqual(self.store.ingest(over)["status"], "quarantined")
+        self.assertEqual(self.loan()["picked_amount"], 3.0)
+
+        # 部分归还 2g、在外消耗 1g：在外清零但有 1g 未交付，借单仍 active。
+        self.store.ingest(self.a.emit("loan.return", {
+            "loan_id": "L1", "amount": 2.0, "actor": "丁",
+            "condition": "2g 完好"}, "2026-06-01T08:00"))
+        self.store.ingest(self.a.emit("loan.consume", {
+            "loan_id": "L1", "amount": 1.0, "actor": "丁",
+            "purpose": "残留提取"}, "2026-06-02T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["out_amount"], 0.0)
+        self.assertEqual(loan["returned_amount"], 2.0)
+        self.assertEqual(loan["consumed_amount"], 1.0)
+        kinds = [e["type"] for e in loan["lineage"]]
+        self.assertEqual(kinds, ["apply", "approve", "pickup", "return", "consume"])
+        # 归还量不得超过在外量。
+        bad = self.a.emit("loan.return", {
+            "loan_id": "L1", "amount": 1.0, "actor": "丁",
+            "condition": "重复归还"}, "2026-06-03T08:00")
+        self.assertEqual(self.store.ingest(bad)["status"], "quarantined")
+
+    def test_return_more_than_out_rejected(self):
+        self.store.ingest(self.loan_apply(amount=2.0))
+        self.store.ingest(self.approve())
+        # 未领用即归还：拒绝。
+        bad = self.a.emit("loan.return", {"loan_id": "L1", "amount": 1.0,
+                                          "actor": "丁", "condition": "x"},
+                          "2026-05-19T08:00")
+        self.assertEqual(self.store.ingest(bad)["status"], "quarantined")
+
+    def test_overdraft_application_quarantined_on_approval(self):
+        # S1 可再分配 7g；申请 8g 在审批锁余量时隔离，申请事件保留。
+        self.store.ingest(self.loan_apply(amount=8.0))
+        result = self.store.ingest(self.approve())
+        self.assertEqual(result["status"], "quarantined")
+        self.assertIn("可再分配余量不足", result["reasons"][0])
+        # 申请仍在但未锁定任何余量。
+        self.assertEqual(self.loan()["status"], "requested")
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 7.0)
+
+
+class LoanConcurrencyTest(LoanTestBase):
+    def test_concurrent_approvals_deterministically_compete_for_margin(self):
+        # A、B 两台设备离线并发，各申请 6g（可再分配仅 7g）。
+        # 显式 lamport 满足 happens-before：两份申请先于两份审批进入规范化全序，
+        # A.apply(30) < B.apply(31) < A.approve(40) < B.approve(41)。
+        a_apply = self.a.emit("loan.apply", {
+            "loan_id": "LA", "sample_id": "S1", "claim_id": "C-loan",
+            "applicant": "研究员甲", "lab": "北大实验室",
+            "purpose": "残留分析", "storage_condition": "4℃避光",
+            "requested_amount": 6.0, "due_date": "2026-08-01T00:00"},
+            "2026-05-15T08:00", lamport=30)
+        b_apply = self.b.emit("loan.apply", {
+            "loan_id": "LB", "sample_id": "S1", "claim_id": "C-loan",
+            "applicant": "研究员乙", "lab": "社科院实验室",
+            "purpose": "同位素", "storage_condition": "常温干燥",
+            "requested_amount": 6.0, "due_date": "2026-08-10T00:00"},
+            "2026-05-15T09:00", lamport=31)
+        a_approve = self.a.emit("loan.approve",
+                                {"loan_id": "LA", "approver": "库管主任丙"},
+                                "2026-05-16T08:00", lamport=40)
+        b_approve = self.b.emit("loan.approve",
+                                {"loan_id": "LB", "approver": "省所保管人戊"},
+                                "2026-05-16T09:00", lamport=41)
+        base_a = [e for e in self.a.events if not e["type"].startswith("loan.")]
+        base_b = [e for e in self.b.events if not e["type"].startswith("loan.")]
+        loan_events = [a_apply, b_apply, a_approve, b_approve]
+        orders = [
+            loan_events,                                   # 正序
+            list(reversed(loan_events)),                  # 逆序
+            [b_approve, a_approve, b_apply, a_apply],     # 穿插乱序
+        ]
+        canonical = None
+        for order in orders:
+            store = FieldworkStore()
+            store.ingest_batch(base_a)
+            store.ingest_batch(base_b)
+            store.ingest_batch(order)
+            views = fw.build_views(store)
+            snapshot = fw.canonical_json(views)
+            canonical = canonical or snapshot
+            # 与物理到达顺序无关：任意重放字节级一致。
+            self.assertEqual(snapshot, canonical)
+            la = next(l for l in views["loans"] if l["loan_id"] == "LA")
+            lb = next(l for l in views["loans"] if l["loan_id"] == "LB")
+            # 规范化全序下 A 先锁 6g；B 的 6g 超额被隔离，零占用。
+            self.assertEqual(la["status"], "reserved")
+            self.assertEqual(lb["status"], "requested")
+            s1 = next(s for s in views["samples"] if s["sample_id"] == "S1")
+            self.assertEqual(s1["reserved_amount"], 6.0)
+            self.assertEqual(s1["redistributable"], 1.0)
+            self.assertTrue(s1["reconciled"])
+            quarantined = {q["event_id"]
+                           for q in views["conflicts"]["quarantined_events"]}
+            self.assertIn(b_approve["event_id"], quarantined)
+
+    def test_offline_duplicate_requests_do_not_double_spend(self):
+        apply_ev = self.loan_apply(amount=3.0)
+        self.store.ingest(apply_ev)
+        self.store.ingest(self.approve())
+        pickup = self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": 3.0, "actor": "丁",
+            "condition": "完好"}, "2026-05-20T08:00")
+        self.assertEqual(self.store.ingest(dict(pickup))["status"], "applied")
+        # 离线客户端重发同一领用事件：duplicate，在外量不翻倍。
+        for _ in range(3):
+            self.assertEqual(self.store.ingest(json.loads(
+                json.dumps(pickup, ensure_ascii=False)))["status"], "duplicate")
+        self.assertEqual(self.loan()["out_amount"], 3.0)
+        # 同一申请重发同样幂等（同 event_id 与载荷，不二次占用）。
+        self.assertEqual(self.store.ingest(json.loads(
+            json.dumps(apply_ev, ensure_ascii=False)))["status"], "duplicate")
+        self.assertEqual(self.sample_s1()["out_on_loan"], 3.0)
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+
+    def test_direct_consume_cannot_take_locked_margin(self):
+        self.store.ingest(self.loan_apply(amount=6.0))
+        self.store.ingest(self.approve())
+        # 锁定 6g 后仅剩 1g，直接消耗 2g 必须隔离。
+        bad = self.a.emit("sample.consume", {
+            "sample_id": "S1", "amount": 2.0,
+            "purpose": "侵占锁定余量"}, "2026-05-17T08:00")
+        self.assertEqual(self.store.ingest(bad)["status"], "quarantined")
+        self.assertEqual(self.sample_s1()["redistributable"], 1.0)
+        ok = self.a.emit("sample.consume", {
+            "sample_id": "S1", "amount": 1.0,
+            "purpose": "在可再分配内"}, "2026-05-17T09:00")
+        self.assertEqual(self.store.ingest(ok)["status"], "applied")
+        self.assertTrue(self.sample_s1()["reconciled"])
+
+
+class LoanFreezeTest(LoanTestBase):
+    def _approved_partial_pickup(self, amount_reserved=4.0, picked=3.0):
+        self.store.ingest(self.loan_apply(amount=amount_reserved))
+        self.store.ingest(self.approve())
+        self.store.ingest(self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": picked, "actor": "丁",
+            "condition": "完好"}, "2026-05-20T08:00"))
+
+    def test_withdrawn_dating_freezes_undelivered_but_keeps_out_part(self):
+        self._approved_partial_pickup()
+        self.store.ingest(self.a.emit("dating.withdraw", {
+            "dating_id": "D1", "reason": "送检样本污染"}, "2026-05-21T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["status"], "frozen")
+        self.assertEqual(loan["base_status"], "active")
+        self.assertEqual(loan["frozen_amount"], 1.0)
+        self.assertEqual(loan["out_amount"], 3.0)
+        self.assertTrue(loan["freeze_reasons"])
+        # 冻结余量仍占用（不能偷偷再分配），可再分配维持 3g。
+        self.assertEqual(self.sample_s1()["frozen_amount"], 1.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 3.0)
+        # 未交付的 1g 禁止出库。
+        bad = self.a.emit("loan.pickup", {"loan_id": "L1", "amount": 1.0,
+                                          "actor": "丁", "condition": "完好"},
+                          "2026-05-22T08:00")
+        self.assertEqual(self.store.ingest(bad)["status"], "quarantined")
+        # 冻结借单进入冲突清单。
+        frozen = fw.build_views(self.store)["conflicts"]["frozen_loans"]
+        self.assertEqual([f["loan_id"] for f in frozen], ["L1"])
+
+    def test_withdrawn_claim_freezes_reserved_loan(self):
+        self.store.ingest(self.loan_apply(amount=4.0))
+        self.store.ingest(self.approve())
+        self.store.ingest(self.a.emit("claim.withdraw", {
+            "claim_id": "C-loan", "reason": "年代判断被新地层证据推翻"},
+            "2026-05-19T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["status"], "frozen")
+        self.assertEqual(loan["frozen_amount"], 4.0)
+        bad = self.a.emit("loan.pickup", {"loan_id": "L1", "amount": 4.0,
+                                          "actor": "丁", "condition": "完好"},
+                          "2026-05-20T08:00")
+        self.assertEqual(self.store.ingest(bad)["status"], "quarantined")
+
+    def test_application_after_claim_withdrawn_is_quarantined(self):
+        self.store.ingest(self.a.emit("claim.withdraw", {
+            "claim_id": "C-loan", "reason": "撤回"}, "2026-05-12T08:00"))
+        result = self.store.ingest(self.loan_apply(at="2026-05-15T08:00"))
+        self.assertEqual(result["status"], "quarantined")
+        self.assertNotIn("L1", self.store.projection.loans)
+
+    def test_quarantined_context_cannot_back_application(self):
+        # 断链设备上的主张不进入投影；引用它的借用申请必须隔离、不扣减。
+        dev = Device("tablet-Q")
+        broken_claim = dev.raw(1, "claim.submit", {
+            "claim_id": "C-ghost", "subject": "M1年代",
+            "proposition": "来自断链设备的主张", "confidence": 0.9,
+            "evidence": ["G1"], "author": "某人"},
+            "2026-05-14T08:00", prev_hash="deadbeef")
+        self.assertEqual(self.store.ingest(broken_claim)["status"],
+                         "quarantined")
+        ev = self.loan_apply(claim="C-ghost", at="2026-05-15T08:00")
+        self.assertEqual(self.store.ingest(ev)["status"], "quarantined")
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 7.0)
+
+    def test_recall_releases_frozen_margin_for_redistribution(self):
+        self._approved_partial_pickup()
+        self.store.ingest(self.a.emit("dating.withdraw", {
+            "dating_id": "D1", "reason": "污染"}, "2026-05-21T08:00"))
+        # 召回：冻结的 1g 未交付立即释放。
+        recall = self.a.emit("loan.recall", {
+            "loan_id": "L1", "by": "库管主任丙",
+            "reason": "引用年代判断撤回"}, "2026-05-22T08:00")
+        self.assertEqual(self.store.ingest(recall)["status"], "applied")
+        loan = self.loan()
+        self.assertEqual(loan["status"], "recalled")
+        self.assertEqual(loan["released_amount"], 1.0)
+        self.assertEqual(loan["out_amount"], 3.0)
+        # 释放后 1g 回到可再分配（在外 3g 仍占用）。
+        self.assertEqual(self.sample_s1()["frozen_amount"], 0.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 4.0)
+        # 追索中的在外部分归还/消耗后结案。
+        self.store.ingest(self.a.emit("loan.return", {
+            "loan_id": "L1", "amount": 2.0, "actor": "丁",
+            "condition": "追回 2g"}, "2026-06-10T08:00"))
+        self.store.ingest(self.a.emit("loan.consume", {
+            "loan_id": "L1", "amount": 1.0, "actor": "丁",
+            "purpose": "追回确认已耗"}, "2026-06-11T08:00"))
+        loan = self.loan()
+        self.assertEqual(loan["status"], "completed")
+        self.assertEqual(loan["out_amount"], 0.0)
+        # 追回归还的 2g 回库、确认消耗 1g：初始10 − 直接3 − 借用消耗1 = 6。
+        self.assertEqual(self.sample_s1()["redistributable"], 6.0)
+        self.assertTrue(self.sample_s1()["reconciled"])
+
+
+class LoanOverdueAndAsOfTest(LoanTestBase):
+    def _active_loan(self, amount=2.0, due="2026-07-01T00:00"):
+        self.store.ingest(self.loan_apply(amount=amount, due=due))
+        self.store.ingest(self.approve())
+        self.store.ingest(self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": amount, "actor": "丁",
+            "condition": "完好"}, "2026-05-20T08:00"))
+
+    def test_overdue_is_derived_purely_from_query_date(self):
+        self._active_loan()
+        before = fw.state_as_of(self.store,
+                                datetime.fromisoformat("2026-06-30T00:00"))
+        loan = next(l for l in before["loans"] if l["loan_id"] == "L1")
+        s1 = next(s for s in before["samples"] if s["sample_id"] == "S1")
+        self.assertFalse(loan["overdue"])
+        self.assertEqual(s1["overdue_amount"], 0.0)
+        self.assertEqual(s1["out_on_loan"], 2.0)
+        self.assertEqual(s1["redistributable"], 5.0)
+
+        after = fw.state_as_of(self.store,
+                               datetime.fromisoformat("2026-07-05T00:00"))
+        loan = next(l for l in after["loans"] if l["loan_id"] == "L1")
+        s1 = next(s for s in after["samples"] if s["sample_id"] == "S1")
+        self.assertTrue(loan["overdue"])
+        self.assertEqual(loan["overdue_since"], "2026-07-01T00:00:00")
+        self.assertEqual(s1["overdue_amount"], 2.0)
+        # 逾期未召回：仍是 active（非追索），但占用不变、账面对账成立。
+        self.assertEqual(loan["status"], "active")
+        self.assertEqual(s1["reclaim_amount"], 0.0)
+        self.assertTrue(s1["reconciled"])
+
+    def test_recall_moves_overdue_amount_into_reclaim(self):
+        self._active_loan()
+        self.store.ingest(self.a.emit("loan.recall", {
+            "loan_id": "L1", "by": "库管主任丙",
+            "reason": "逾期未还"}, "2026-07-06T08:00"))
+        after = fw.state_as_of(self.store,
+                               datetime.fromisoformat("2026-07-10T00:00"))
+        loan = next(l for l in after["loans"] if l["loan_id"] == "L1")
+        s1 = next(s for s in after["samples"] if s["sample_id"] == "S1")
+        self.assertEqual(loan["status"], "recalled")
+        self.assertTrue(loan["in_recall"])
+        self.assertEqual(s1["reclaim_amount"], 2.0)
+        self.assertEqual(s1["overdue_amount"], 2.0)
+        self.assertEqual(s1["out_on_loan"], 2.0)
+
+    def test_historical_point_shows_reserved_then_out_then_settled(self):
+        self._active_loan(amount=2.0)
+        # 审批后、领用前：在借 0、预锁 2。
+        point = fw.state_as_of(self.store,
+                               datetime.fromisoformat("2026-05-18T00:00"))
+        s1 = next(s for s in point["samples"] if s["sample_id"] == "S1")
+        loan = next(l for l in point["loans"] if l["loan_id"] == "L1")
+        self.assertEqual(loan["status"], "reserved")
+        self.assertEqual(s1["out_on_loan"], 0.0)
+        self.assertEqual(s1["reserved_amount"], 2.0)
+        self.assertEqual(s1["redistributable"], 5.0)
+        # 归还结案后：在借归 0、消耗/归还入账、可再分配回升。
+        self.store.ingest(self.a.emit("loan.return", {
+            "loan_id": "L1", "amount": 1.0, "actor": "丁",
+            "condition": "完好"}, "2026-06-01T08:00"))
+        self.store.ingest(self.a.emit("loan.consume", {
+            "loan_id": "L1", "amount": 1.0, "actor": "丁",
+            "purpose": "检测消耗"}, "2026-06-02T08:00"))
+        settled = fw.state_as_of(self.store,
+                                 datetime.fromisoformat("2026-06-03T00:00"))
+        s1 = next(s for s in settled["samples"] if s["sample_id"] == "S1")
+        loan = next(l for l in settled["loans"] if l["loan_id"] == "L1")
+        self.assertEqual(loan["status"], "completed")
+        self.assertEqual(s1["out_on_loan"], 0.0)
+        self.assertEqual(s1["reserved_amount"], 0.0)
+        # 初始10 - 直接消耗3 - 借用消耗1 - 在外0 - 预锁0 = 6。
+        self.assertEqual(s1["redistributable"], 6.0)
+        self.assertTrue(s1["reconciled"])
+
+
+class LoanReconciliationTest(LoanTestBase):
+    def test_books_match_custody_chain_across_mixed_loans(self):
+        # 两张借单：LA 领 2g 在外；LB 批 3g 尚未领（预锁）。
+        self.store.ingest(self.loan_apply("LA", amount=2.0,
+                                          at="2026-05-15T08:00"))
+        self.store.ingest(self.approve("LA", at="2026-05-16T08:00"))
+        self.store.ingest(self.a.emit("loan.pickup", {
+            "loan_id": "LA", "amount": 2.0, "actor": "丁",
+            "condition": "完好"}, "2026-05-18T08:00"))
+        self.store.ingest(self.loan_apply("LB", amount=3.0,
+                                          applicant="研究员乙",
+                                          lab="社科院实验室",
+                                          at="2026-05-15T09:00"))
+        self.store.ingest(self.approve("LB", approver="省所保管人戊",
+                                       at="2026-05-16T09:00"))
+        s1 = self.sample_s1()
+        # 10 = 直接3 + 借用消耗0 + 在外2 + 预锁3 + 可再分配2。
+        self.assertEqual(s1["out_on_loan"], 2.0)
+        self.assertEqual(s1["reserved_amount"], 3.0)
+        self.assertEqual(s1["redistributable"], 2.0)
+        self.assertTrue(s1["reconciled"])
+        # 所有样本恒等式都成立（含夹具里的其他样本）。
+        self.assertTrue(all(s["reconciled"]
+                            for s in fw.build_views(self.store)["samples"]))
+
+
+class LoanChainGateTest(LoanTestBase):
+    def test_gap_holds_reservation_until_ancestor_arrives(self):
+        dev = Device("tablet-L")
+        apply_ev = dev.emit("loan.apply", {
+            "loan_id": "LG", "sample_id": "S1", "claim_id": "C-loan",
+            "applicant": "研究员甲", "lab": "北大实验室",
+            "purpose": "分析", "storage_condition": "常温",
+            "requested_amount": 4.0, "due_date": "2026-08-01T00:00"},
+            "2026-05-15T08:00")
+        approve_ev = dev.emit("loan.approve", {"loan_id": "LG",
+                                               "approver": "库管主任丙"},
+                              "2026-05-16T08:00")
+        # 审批先离线归队、申请缺环：waiting，不锁定任何余量。
+        self.assertEqual(self.store.ingest(approve_ev)["status"], "waiting")
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+        self.assertNotIn("LG", self.store.projection.loans)
+        # 祖先归队后自愈：申请与审批依次生效，锁定 4g。
+        self.assertEqual(self.store.ingest(apply_ev)["status"], "applied")
+        self.assertEqual(self.store.status_of(approve_ev["event_id"])["status"],
+                         "applied")
+        self.assertEqual(self.loan("LG")["status"], "reserved")
+        self.assertEqual(self.sample_s1()["reserved_amount"], 4.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 3.0)
+
+    def test_broken_loan_chain_quarantined_without_deduction(self):
+        dev = Device("tablet-BR")
+        dev.emit("loan.apply", {
+            "loan_id": "LB1", "sample_id": "S1", "claim_id": "C-loan",
+            "applicant": "甲", "lab": "L", "purpose": "p",
+            "storage_condition": "常温", "requested_amount": 4.0,
+            "due_date": "2026-08-01T00:00"}, "2026-05-15T08:00")
+        bad = dev.raw(2, "loan.approve", {"loan_id": "LB1",
+                                          "approver": "库管主任丙"},
+                      "2026-05-16T08:00", prev_hash="deadbeef")
+        successor = dev.emit("loan.pickup", {"loan_id": "LB1", "amount": 4.0,
+                                             "actor": "丁",
+                                             "condition": "完好"},
+                             "2026-05-17T08:00")
+        self.store.ingest_batch([bad, successor])
+        self.assertEqual(self.store.status_of(bad["event_id"])["status"],
+                         "quarantined")
+        self.assertEqual(self.store.status_of(successor["event_id"])["status"],
+                         "quarantined")
+        # 断链审批不锁定、断链领用不扣减在外量。
+        self.assertEqual(self.sample_s1()["reserved_amount"], 0.0)
+        self.assertEqual(self.sample_s1()["out_on_loan"], 0.0)
+        self.assertEqual(self.sample_s1()["redistributable"], 7.0)
+
+
+class LoanPersistenceTest(LoanTestBase):
+    def test_restart_restores_occupancy_recall_and_overdue(self):
+        self.store.ingest(self.loan_apply(amount=4.0))
+        self.store.ingest(self.approve())
+        pickup = self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": 3.0, "actor": "丁",
+            "condition": "完好"}, "2026-05-20T08:00")
+        self.store.ingest(pickup)
+        self.store.ingest(self.a.emit("dating.withdraw", {
+            "dating_id": "D1", "reason": "污染"}, "2026-05-21T08:00"))
+        self.store.ingest(self.a.emit("loan.recall", {
+            "loan_id": "L1", "by": "库管主任丙",
+            "reason": "依据失效"}, "2026-05-22T08:00"))
+        # 离线重复领用请求：duplicate，不重复扣减。
+        self.assertEqual(self.store.ingest(json.loads(
+            json.dumps(pickup, ensure_ascii=False)))["status"], "duplicate")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "loans.jsonl")
+            # 用物理日志落盘一个全新 store（等价于重启加载同一份 JSONL）。
+            first = FieldworkStore(journal_path=path)
+            first.ingest_batch(list(reversed(self.store.physical_log())))
+            second = FieldworkStore()
+            second.load_jsonl(path)
+            self.assertEqual(
+                fw.canonical_json(fw.build_views(first)),
+                fw.canonical_json(fw.build_views(second)),
+            )
+            views = fw.build_views(second)
+            loan = next(l for l in views["loans"] if l["loan_id"] == "L1")
+            s1 = next(s for s in views["samples"] if s["sample_id"] == "S1")
+            # 占用/在外/追索/冻结全部还原。
+            self.assertEqual(loan["status"], "recalled")
+            self.assertEqual(loan["picked_amount"], 3.0)
+            self.assertEqual(loan["released_amount"], 1.0)
+            self.assertEqual(s1["out_on_loan"], 3.0)
+            self.assertEqual(s1["reclaim_amount"], 3.0)
+            self.assertEqual(s1["frozen_amount"], 0.0)
+            self.assertEqual(s1["redistributable"], 4.0)
+            self.assertTrue(s1["reconciled"])
+            # 重启后按历史时点仍能准确还原在借/逾期。
+            past = fw.state_as_of(second,
+                                  datetime.fromisoformat("2026-08-05T00:00"))
+            past_loan = next(l for l in past["loans"] if l["loan_id"] == "L1")
+            past_s1 = next(s for s in past["samples"] if s["sample_id"] == "S1")
+            self.assertTrue(past_loan["overdue"])
+            self.assertEqual(past_s1["overdue_amount"], 3.0)
+            # 重复领用落盘/重放后依旧不二次扣减。
+            self.assertEqual(past_s1["out_on_loan"], 3.0)
+
+
+class HttpLoanTest(LoanTestBase):
+    @classmethod
+    def setUpClass(cls):
+        service.reset_store()
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _post(self, event):
+        data = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        request = Request(self.base + "/events", data=data, method="POST",
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=3) as response:
+            return response.status, json.load(response)
+
+    def _get(self, path):
+        with urlopen(self.base + path, timeout=3) as response:
+            return json.load(response)
+
+    def test_loans_endpoint_and_asof_reconciliation(self):
+        # 灌入夹具事件（含主张）。
+        status, _ = self._post({"events": self.a.events})
+        self.assertEqual(status, 200)
+        self._post(self.loan_apply(amount=4.0, due="2026-07-01T00:00"))
+        self._post(self.approve())
+        self._post(self.a.emit("loan.pickup", {
+            "loan_id": "L1", "amount": 4.0, "actor": "丁",
+            "condition": "完好"}, "2026-05-20T08:00"))
+
+        loans = self._get("/loans")
+        loan = next(l for l in loans["loans"] if l["loan_id"] == "L1")
+        self.assertEqual(loan["status"], "active")
+        self.assertEqual(loan["out_amount"], 4.0)
+        summary = next(s for s in loans["samples"] if s["sample_id"] == "S1")
+        self.assertEqual(summary["out_on_loan"], 4.0)
+        self.assertEqual(summary["redistributable"], 3.0)
+        self.assertTrue(summary["reconciled"])
+
+        # /samples 同样给出对账字段。
+        s1 = next(s for s in self._get("/samples")["samples"]
+                  if s["sample_id"] == "S1")
+        self.assertTrue(s1["reconciled"])
+
+        # 指定历史日期：领用前为 reserved，在借为 0。
+        past = self._get("/loans?date=2026-05-18T00:00:00")
+        loan = next(l for l in past["loans"] if l["loan_id"] == "L1")
+        self.assertEqual(loan["status"], "reserved")
+        s1p = next(s for s in past["samples"] if s["sample_id"] == "S1")
+        self.assertEqual(s1p["out_on_loan"], 0.0)
+        self.assertEqual(s1p["redistributable"], 3.0)
+
+        # 逾期后查询。
+        due = self._get("/loans?date=2026-07-05T00:00:00")
+        loan = next(l for l in due["loans"] if l["loan_id"] == "L1")
+        self.assertTrue(loan["overdue"])
+        s1d = next(s for s in due["samples"] if s["sample_id"] == "S1")
+        self.assertEqual(s1d["overdue_amount"], 4.0)
+
+
 if __name__ == "__main__":
     unittest.main()
